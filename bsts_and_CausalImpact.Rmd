@@ -1,0 +1,400 @@
+---
+title: "Comparing workflows of the bsts and the CausalImpact R package"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library('bsts')
+library('CausalImpact')
+library('ggplot2')
+```
+
+## Introduction
+
+This notebook contains some experiments about fitting Bayesian structural time series 
+using
+
+a) the bsts R package (https://CRAN.R-project.org/package=bsts by Steven L. Scott) and 
+b) the CausalImpact R package (CausalImpact 1.2.1, Brodersen et al., Annals of Applied Statistics (2015), http://google.github.io/CausalImpact/) which builds on bsts and enables the analysis of the causal impact of an intervention on a time series.
+
+The goal of this notebook is to compare workflows and results, not to achieve 
+the best fit possible. I am fitting one model with a local level and a
+seasonality component, these components can easily be included into the 
+CausalImpact workflow, using default parameters. In addition, I test a model with 
+an autoregressive and a seasonality component, therefore I need to feed a 
+custom bsts model into CausalImpact. This was a learning exercise I did - maybe 
+it is useful to others. Comments and corrections are welcome.
+
+## Data preparation
+
+As a test data set I am using the "Minimum Daily Temperatures Dataset"
+which describes the minimum daily temperatures in Melbourne over 10 years.
+The source of the data is credited as the Australian Bureau of Meteorology.
+The data set and further explanations can be found here:
+https://machinelearningmastery.com/time-series-datasets-for-machine-learning/.
+
+For the following experiments roughly the first three years (1096 data points) 
+have been used for training (pre-period), trying to forecast 
+the rest of the time series (post-period, data points 1097 to 3650). 
+For the CausalImpact package this means that I am 
+trying to analyze the causal effect on the target time series due to an 
+intervention that happened after three years. As (to my knowledge) such an 
+intervention did not happen any deviations from the fit in the post-period 
+indicate that the fitted model is not fully capturing the data generating 
+process.
+
+```{r data}
+data <- read.csv('daily-min-temperatures.csv')
+# plot complete data set
+plot(data$Temp)
+
+# select roughly the first three years for training
+pre.period <- c(1, 1096) 
+post.period <- c(1097, 3650)
+# store training period data in y
+y <- data$Temp[1:pre.period[2]]
+plot(y)
+```
+
+To enable fitting custom models with CausalImpact I need a version of the 
+training data where the post-period entries have been set to NA
+(see documentation: https://google.github.io/CausalImpact/CausalImpact.html).
+y contains the pre-period data. y2 holds the same (pre-period) data as y, 
+but still has the post-period entries, where the values have been set to NA.
+
+```{r data2}
+y2 <- data$Temp
+# store post-period data
+post.period.response <- data$Temp[(post.period[1]) : post.period[2]]
+# target values need to be set to NA in the post period to enable fitting custom models with CausalImpact
+y2[post.period[1] : post.period[2]] <- NA
+```
+
+The CausalImpact package comes with the the option to standardize the
+columns of the data set (based on the data from the pre-intervention period)
+which defaults to true (standardize.data=TRUE). Here, to simplify the comparison 
+with the bsts results, and as discussed in Brodersen et al., I will use the 
+original (unscaled) version of the data and perform the scaling in the priors 
+to ensure a reasonable scale. 
+
+```{r}
+# standard deviation of the training data, used for scaling of priors (see variable sdy below)
+sd(y)
+```
+
+## Fit using a random walk and a seasonality component
+
+The random walk (local level) and the seasonality component are both build
+into the CausalImpact package, hence defaults can be used. For the priors I 
+use the defaults from the CausalImpact package to enable an 
+easy comparison (for details see Brodersen et al. or the CausalImpact object 
+created in R). Also, for the temperature data set used here, the CausalImpact
+defaults work better than the bsts defaults (side note: with the bsts default 
+priors the local level component picks up some seasonality. As the local level 
+component cannot forecast any seasonality the quality of the fit isn't good.)
+For the seasonality component I am using 12 seasons with 31 data points (as the 
+data set has daily temperatures). This will cause some inaccuracies in the 
+long-term forecast as some months have less than 31 days.
+
+Fit the model using bsts:
+
+```{r fit-ll-season-bsts}
+
+sdy <- 4.46 # standard deviation of training period
+
+# local level component ... priors adapted from CausalImpact
+mu.ll <- zoo(1)
+ss.ll.season <- AddLocalLevel(list(), 
+                              y,
+                              sigma.prior = SdPrior(sdy/100,
+                                                    sample.size = 32,
+                                                    initial.value = sdy/100,
+                                                    fixed = FALSE,
+                                                    upper.limit = sdy),
+                              initial.state.prior = NormalPrior(mu = mu.ll,
+                                                                sigma = sdy,
+                                                                initial.value = mu.ll,
+                                                                fixed = FALSE
+                                                                )
+                              )
+
+# seasonality component ... priors adapted from CausalImpact
+mu.season <- 0
+ss.ll.season <- AddSeasonal(ss.ll.season, 
+                            y, 
+                            sigma.prior = SdPrior(sdy/100,
+                                                  sample.size = 0.01,
+                                                  initial.value = sdy/100,
+                                                  fixed = FALSE,
+                                                  upper.limit = sdy
+                                                  ),
+                            initial.state.prior = NormalPrior(mu.season,
+                                                              sigma = sdy,
+                                                              initial.value = mu.season,
+                                                              fixed = FALSE
+                                                              ),
+                            nseasons = 12, 
+                            season.duration = 31)
+
+# fit the bsts model using 1000 iterations
+# the prior here is for the residual noise in the observation equation
+model.ll.season <- bsts(y, 
+                        state.specification = ss.ll.season,
+                        family = c("gaussian"),
+                        prior = SdPrior(sd(y),
+                                        sample.size = 0.01,
+                                        initial.value = sdy,
+                                        fixed = FALSE,
+                                        upper.limit = 1.2 * sdy
+                                        ),
+                        niter = 1000)
+```
+
+Same fit but via the CausalImpact package:
+
+```{r fit-ll-season-CI}
+impact.ll.season <- CausalImpact(data$Temp, 
+                                 pre.period, 
+                                 post.period, 
+                                 model.args = list(niter = 1000,
+                                                   standardize.data = FALSE,
+                                                   prior.level.sd = 0.01,
+                                                   nseasons = 12, 
+                                                   season.duration = 31,
+                                                   max.flips = -1
+                                                   ),
+                                 alpha = 0.05) # quantiles
+
+# plot(impact.ll.season$series) # result overview
+# standard causal impact plot
+plot(impact.ll.season)
+```
+
+### Compare "pure bsts" and CausalImpact results
+
+**log-likelihood...:** some differences are visible, see discussion below 
+(autoregressive model).
+
+```{r log-likelihood}
+par(mfrow = c(1,2))
+# bsts log-likelihood
+plot(model.ll.season$log.likelihood)
+# CausalImpact log-likelihood
+plot(impact.ll.season[4]$model$bsts.model$log.likelihood)
+```
+
+**Fitted model components...:** the plots below show the fitted components 
+(local level and seasonality) for the bsts and the CausalImpact fit. The 
+results are extremely similar, minor differences (especially at the first 
+time steps) remain (the effect is more obvious for the autoregressive
+model, see discussion below!).
+
+```{r ll-season-components}
+# bsts components
+plot(model.ll.season, "components",  xlim=c(1, pre.period[2]), ylim=c(-7, 14))
+# CausalImpact components
+plot(impact.ll.season[4]$model$bsts.model, 'components', 
+     xlim=c(1, pre.period[2]), ylim=c(-7, 14))
+```
+
+**Fit and forecast:** As shown in the CausalImpact default plot ("original"
+panel) the fit looks good in the pre-period. The quality of the forecast 
+decreases with increasing time into the 
+future, mainly because the 31-day "seasons" are slightly too long on average. 
+Overall the forecast is slightly too low, compared to the observed time series. 
+As expected for a model 
+including a random walk component credibility intervals get wider with increasing 
+forecasted time into the future, although the effect is not very pronounced 
+here. Visually the "pure bsts" and the CausalImpact forecast yield the same
+results, minor (hardly visible) differences exist (for these differences see 
+discussion below for the autoregressive + seasonal model).
+
+```{r compare-forecasts}
+## pure bsts forecast
+# get burn period as used in CausalImpact,
+# see https://github.com/google/CausalImpact/blob/master/R/impact_inference.R
+burn.period <- SuggestBurn(0.1, model.ll.season)
+print(paste("burn period:", burn.period))
+# bsts prediction for post.period
+# alpha (quantiles) = 0.025 (0.095) are the bsts default
+pred.ll.season <- predict(model.ll.season,
+                          horizon = post.period[2] - pre.period[2], 
+                          burn = burn.period,
+                          quantiles = c(0.05, 0.95))
+
+plot.ll.season <- plot(pred.ll.season, ylim=c(-5,30),
+                       interval.quantiles = c(0.05, 0.95)) + 
+  grid(lty = 2)
+
+## CausalImpact forecast
+# convert CausalImpact results from zoo object to df for plotting
+ci.result.df <- as.data.frame(impact.ll.season$series)
+
+# ggplot of CausalImpact point prediction with confidence intervals
+ci.point.pred <- ggplot(ci.result.df, aes(as.numeric(row.names(ci.result.df)), 
+                                          point.pred)) +
+  geom_line(color='blue') + 
+  geom_ribbon(aes(ymin = point.pred.lower, ymax = point.pred.upper), alpha = 0.2) +
+  theme_linedraw() +
+  ylim(-5, 30)
+ci.point.pred 
+```
+
+## Fit using an autoregressive AR(1) state component and a seasonality component
+
+In this section I fit the same data but I replace the local level component with 
+an autoregressive component. Using an autoregressive component to capture excess 
+noise can be more realistic if the confidence in the fit is 
+expected to stay the same with increasing time into the future 
+(e.g. if there is no reason for "blowing up" errors). The default model used
+by the CausalImpact package does not support an autoregressive model, hence 
+feeding in a custom bsts model is necessary.
+
+```{r fit-ar-season}
+# define function to fit bsts model (autoregressive and seasonal component) 
+# for different time series
+fit.model.ar.season <- function(data2, sdy, mu.ll = zoo(1), mu.season = 0){
+  # autoregressive component. SDPrior adapted from local level component in the
+  # previous section
+  ss.ar.season <- AddAr(list(), 
+                        y = data2,
+                        lags = 1,
+                        sigma.prior = SdPrior(sdy/100,
+                                              sample.size = 32,
+                                              initial.value = sdy/100,
+                                              fixed = FALSE,
+                                              upper.limit = sdy),
+                        initial.state.prior = NormalPrior(mu = mu.ll,
+                                                          sigma = sdy,
+                                                          initial.value = mu.ll,
+                                                          fixed = FALSE
+                                                          ))
+  # seasonality component ... 
+  ss.ar.season <- AddSeasonal(ss.ar.season, 
+                              y = data2, 
+                              sigma.prior = SdPrior(sdy/100,
+                                                    sample.size = 0.01,
+                                                    initial.value = sdy/100,
+                                                    fixed = FALSE,
+                                                    upper.limit = sdy
+                                                    ),
+                              initial.state.prior = NormalPrior(mu.season,
+                                                                sigma = sdy,
+                                                                initial.value = mu.season,
+                                                                fixed = FALSE
+                                                                ),
+                              nseasons = 12, 
+                              season.duration = 31)
+  # fit model ...
+  model.ar.season <- bsts(data2, 
+                          state.specification = ss.ar.season, 
+                          family = c("gaussian"),
+                          prior = SdPrior(sdy,
+                                          sample.size = 0.01,
+                                          initial.value = sdy,
+                                          fixed = FALSE,
+                                          upper.limit = 1.2 * sdy
+                                          ),
+                          niter = 1000)
+  
+  return(model.ar.season)
+}
+
+# fit bsts model on pre-period data
+model.ar.season <- fit.model.ar.season(data2 = y, sdy = 4.46)
+# fit bsts model on pre-period data with post-period set to NA for CausalImpact
+model.ar.season2 <- fit.model.ar.season(data2 = y2, sdy = 4.46)
+# apply CausalImpact package to custom model
+impact.ar.season <- CausalImpact(bsts.model = model.ar.season2,
+                                 post.period.response = post.period.response)
+```
+
+### Compare "pure bsts" and CausalImpact results
+
+**Fitted model components:** the AR component is picking up some seasonal pattern, 
+which will reduce the quality of the forecast as the AR component cannot
+forecast seasonality (side note: a "flatter" AR component can be enforced by 
+increasing the weight of the prior... e.g. sample.size = 100 ... but this leads 
+to other unwanted behavior). Padding the training data with zeros seems to lead 
+to minor differences between the two fits (?! not sure...), for example visible 
+at the positions of the peaks of the seasonality component e.g. at time points 
+~390, ~750). These differences will also be visible in the forecasts.
+
+```{r ar-season-components}
+# components of bsts model for time series y (without NAs)
+plot(model.ar.season, "components",  xlim=c(1, pre.period[2]), ylim=c(-7, 20))
+# components of bsts model for time series y2 (with NAs)
+plot(model.ar.season2, "components",  xlim=c(1, pre.period[2]), ylim=c(-7, 20))
+# the following code retrieves the same plot from the CausalImpact object
+# plot(impact.ar.season[4]$model$bsts.model, 'components', 
+#      xlim=c(1, pre.period[2]), hylim=c(-7, 20))
+```
+
+**Forecasts...:** the model picked up a downwards trend from the training period
+that does not exist long term. As in the previous section the 31-day seasons are 
+too long on average. In addition,
+the the amplitude of the forecasted pattern is too small, as some seasonality has
+been picked up by the autoregressive component. Therefore, the model with the
+local level component discussed above yields the better fit.
+There are some differences visible between the "pure bsts" and the CausalImpact
+version, especially around the annual peaks. Although minor difference could be
+due to numerical (random sampling) reasons, these differences seem to be due to
+the zero-padding (?).
+
+```{r compare-forecasts-ar-season}
+# get burn period
+burn.period.ar.season <- SuggestBurn(0.1, model.ar.season)
+# print(paste("burn period:", burn.period.ar.season))
+# bsts prediction for post.period
+pred.ar.season <- predict(model.ar.season, 
+                          horizon = post.period[2]-pre.period[2], 
+                          burn = burn.period.ar.season,
+                          quantiles = c(0.05, 0.95))
+
+bsts.forcast.ar.season <- plot(pred.ar.season, ylim=c(-35,50),
+                               interval.quantiles = c(0.05, 0.95)) + 
+  grid(lty = 2)
+
+# convert CausalImpact results from zoo object to df for plotting
+ci.result.df2 <- as.data.frame(impact.ar.season$series)
+# ci.result.df
+
+# ggplot if CausalImpact point prediction with confidence intervals
+ci.point.pred2 <- ggplot(ci.result.df2, aes(as.numeric(row.names(ci.result.df2)), 
+                                          point.pred)) +
+  geom_line(color='blue') + 
+  geom_ribbon(aes(ymin = point.pred.lower, ymax = point.pred.upper), alpha = 0.2) +
+  theme_linedraw() +
+  ylim(-35, 50)
+ci.point.pred2
+
+plot(impact.ar.season)
+```
+
+### Additional remark: analysis of selected fitted standard deviations and coefficients
+
+As one can also see in the fitted components / forecasts, the variability of
+the AR components is a lot higher than the variability of the local level
+component. Note that the fitted AR1 coefficient is very close to 1, hence the
+two models are quite similar.
+
+```{r ar-season-coefficients}
+# standard deviation of the local level component
+plot(model.ll.season$sigma.level)
+# standard deviation of the autoregessive component
+plot(model.ar.season$AR1.sigma)
+# fitted AR1 component
+plot(model.ar.season$AR1.coefficients)
+```
+
+## References and learning resources
+
+* Data set: https://machinelearningmastery.com/time-series-datasets-for-machine-learning/
+* bsts R package: https://CRAN.R-project.org/package=bsts by Steven L. Scott
+* CausalImpact R package: CausalImpact 1.2.1, Brodersen et al., Annals of Applied Statistics (2015), http://google.github.io/CausalImpact/
+* bsts tutorial I found helpful: https://www.unofficialgoogledatascience.com/2017/07/fitting-bayesian-structural-time-series.html
+
+
+
+
